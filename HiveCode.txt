@@ -1,0 +1,134 @@
+
+--create the tweets_raw table containing the records as received from Twitter
+
+CREATE EXTERNAL TABLE tweets_raw (
+   id BIGINT,
+   created_at STRING,
+   source STRING,
+   favorited BOOLEAN,
+   retweet_count INT,
+   retweeted_status STRUCT<
+      text:STRING,
+      user:STRUCT<screen_name:STRING,name:STRING>>,
+   entities STRUCT<
+      urls:ARRAY<STRUCT<expanded_url:STRING>>,
+      user_mentions:ARRAY<STRUCT<screen_name:STRING,name:STRING>>,
+      hashtags:ARRAY<STRUCT<text:STRING>>>,
+   text STRING,
+   user STRUCT<
+      screen_name:STRING,
+      name:STRING,
+      friends_count:INT,
+      followers_count:INT,
+      statuses_count:INT,
+      verified:BOOLEAN,
+      utc_offset:STRING, -- was INT but nulls are strings
+      time_zone:STRING>,
+   in_reply_to_screen_name STRING,
+   year int,
+   month int,
+   day int,
+   hour int
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+LOCATION '/user/ashwa/twitterdata'
+;
+
+
+SELECT * FROM tweets_raw LIMIT 100;
+
+-- create sentiment dictionary (ONE TIME PROCESS)
+CREATE EXTERNAL TABLE dictionary (
+    type string,
+    length int,
+    word string,
+    pos string,
+    stemmed string,
+    polarity string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' 
+STORED AS TEXTFILE
+LOCATION '/user/ashwa/dictionarydata';
+
+
+
+-- create the time zone to country mapper (ONE TIME PROCESS)
+CREATE EXTERNAL TABLE time_zone_map (
+    time_zone string,
+    country string,
+    notes string
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' 
+STORED AS TEXTFILE
+LOCATION '/user/ashwa/timedata';
+
+-- Clean up tweets
+CREATE VIEW tweets_simple AS
+SELECT
+  id,
+  cast ( from_unixtime( unix_timestamp(concat( '2017 ', substring(created_at,5,15)), 'yyyy MMM dd hh:mm:ss')) as timestamp) ts,
+  text,
+  user.time_zone 
+FROM tweets_raw
+;
+
+-- Get the tweets based on matching time zones
+CREATE VIEW tweets_clean AS
+SELECT
+  id,
+  ts,
+  text,
+  m.country 
+ FROM tweets_simple t LEFT OUTER JOIN time_zone_map m ON t.time_zone = m.time_zone;
+ 
+ 
+ 
+ -- Compute sentiment
+ create view l1 as select id, words from tweets_raw lateral view explode(sentences(lower(text))) dummy as words;
+ create view l2 as select id, word from l1 lateral view explode( words ) dummy as word ;
+ create view l3 as select 
+     id, 
+     l2.word, 
+     case d.polarity 
+       when  'negative' then -1
+       when 'positive' then 1 
+       else 0 end as polarity 
+  from l2 left outer join dictionary d on l2.word = d.word;
+
+-- Create the sentiments (Note: Need to create - hadoop fs -mkdir \\\apps\hive\warehouse)
+create table tweets_sentiment as select 
+  id, 
+  case 
+    when sum( polarity ) > 0 then 'positive' 
+    when sum( polarity ) < 0 then 'negative'  
+    else 'neutral' end as sentiment 
+ from l3 group by id;
+
+-- put everything back together and re-number sentiment --STORED AS ORC
+CREATE TABLE tweetsbi 
+AS
+SELECT 
+  t.id,t.country,
+  case s.sentiment 
+    when 'positive' then 1 
+    when 'neutral' then 0 
+    when 'negative' then -1 
+  end as sentiment  
+FROM tweets_clean t LEFT OUTER JOIN tweets_sentiment s on t.id = s.id;
+
+CREATE TABLE tweetsbi2 
+AS
+SELECT 
+  t.id,
+  case s.sentiment 
+    when 'positive' then 1 
+    when 'neutral' then 0 
+    when 'negative' then -1 
+  end as sentiment  
+FROM tweets_clean t LEFT OUTER JOIN tweets_sentiment s on t.id = s.id;
+
+CREATE TABLE tweetsbi5 
+AS
+SELECT 
+  t.text
+FROM tweets_clean t LEFT OUTER JOIN tweets_sentiment s on t.id = s.id;
